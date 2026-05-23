@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
     str::FromStr,
     sync::{
-        atomic::{AtomicBool, AtomicU64, AtomicU8},
+        atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
         mpsc, Arc, Mutex,
     },
     thread,
@@ -126,16 +126,140 @@ use crate::{
     util::ffi_server_info,
 };
 
+#[derive(Default)]
+pub(crate) struct MemoryControlRssState {
+    raw_rss: AtomicU64,
+    rss_file: AtomicU64,
+    memory_control_rss: AtomicU64,
+    valid: AtomicBool,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct MemoryControlRssSnapshot {
+    pub(crate) raw_rss: u64,
+    pub(crate) rss_file: u64,
+    pub(crate) memory_control_rss: u64,
+    pub(crate) valid: bool,
+}
+
+#[cfg(target_os = "linux")]
+fn parse_status_kib(line: &str, key: &str) -> Option<u64> {
+    let value = line.strip_prefix(key)?;
+    let value = value.trim().strip_suffix("kB")?.trim();
+    value.parse::<u64>().ok().map(|kb| kb.saturating_mul(1024))
+}
+
+#[cfg(target_os = "linux")]
+fn read_raw_rss_and_rss_file() -> Option<(u64, u64)> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let mut raw_rss = None;
+    let mut rss_file = None;
+    for line in status.lines() {
+        if raw_rss.is_none() {
+            raw_rss = parse_status_kib(line, "VmRSS:");
+        }
+        if rss_file.is_none() {
+            rss_file = parse_status_kib(line, "RssFile:");
+        }
+        if raw_rss.is_some() && rss_file.is_some() {
+            break;
+        }
+    }
+    match (raw_rss, rss_file) {
+        (Some(raw_rss), Some(rss_file)) => Some((raw_rss, rss_file)),
+        _ => None,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_raw_rss_and_rss_file() -> Option<(u64, u64)> {
+    None
+}
+
+impl MemoryControlRssState {
+    pub(crate) fn refresh(&self, exclude_rss_file: bool) {
+        if let Some((raw_rss, rss_file)) = read_raw_rss_and_rss_file() {
+            let memory_control_rss = if exclude_rss_file {
+                raw_rss.saturating_sub(rss_file)
+            } else {
+                raw_rss
+            };
+            self.raw_rss.store(raw_rss, Ordering::Release);
+            self.rss_file.store(rss_file, Ordering::Release);
+            self.memory_control_rss
+                .store(memory_control_rss, Ordering::Release);
+            self.valid.store(true, Ordering::Release);
+        } else {
+            self.valid.store(false, Ordering::Release);
+        }
+    }
+
+    pub(crate) fn load(&self) -> MemoryControlRssSnapshot {
+        let valid = self.valid.load(Ordering::Acquire);
+        if !valid {
+            return MemoryControlRssSnapshot {
+                raw_rss: 0,
+                rss_file: 0,
+                memory_control_rss: 0,
+                valid,
+            };
+        }
+
+        MemoryControlRssSnapshot {
+            raw_rss: self.raw_rss.load(Ordering::Acquire),
+            rss_file: self.rss_file.load(Ordering::Acquire),
+            memory_control_rss: self.memory_control_rss.load(Ordering::Acquire),
+            valid,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct TiFlashGrpcMessageFilter {
     reject_messages_on_memory_ratio: f64,
+    memory_usage_high_water: u64,
+    memory_control_rss_state: Arc<MemoryControlRssState>,
 }
 
 impl TiFlashGrpcMessageFilter {
     pub fn new(reject_messages_on_memory_ratio: f64) -> Self {
         Self {
             reject_messages_on_memory_ratio,
+            memory_usage_high_water: 0,
+            memory_control_rss_state: Arc::new(MemoryControlRssState::default()),
         }
+    }
+
+    pub(crate) fn new_with_memory_control_rss(
+        reject_messages_on_memory_ratio: f64,
+        memory_usage_high_water: u64,
+        memory_control_rss_state: Arc<MemoryControlRssState>,
+    ) -> Self {
+        Self {
+            reject_messages_on_memory_ratio,
+            memory_usage_high_water,
+            memory_control_rss_state,
+        }
+    }
+
+    fn should_reject_by_memory_control_rss(&self) -> bool {
+        let info = self.memory_control_rss_state.load();
+        if info.valid {
+            if info.memory_control_rss >= self.memory_usage_high_water {
+                debug!(
+                    "memory control rss reaches high water";
+                    "memory_control_rss" => info.memory_control_rss,
+                    "raw_rss" => info.raw_rss,
+                    "rss_file" => info.rss_file,
+                    "high_water" => self.memory_usage_high_water,
+                );
+                return true;
+            }
+            return false;
+        }
+
+        let mut usage = 0;
+        memory_usage_reaches_high_water(&mut usage)
     }
 }
 
@@ -151,8 +275,7 @@ impl RaftGrpcMessageFilter for TiFlashGrpcMessageFilter {
             return false;
         }
 
-        let mut usage = 0;
-        memory_usage_reaches_high_water(&mut usage)
+        self.should_reject_by_memory_control_rss()
     }
 
     fn should_reject_snapshot(&self) -> bool {
@@ -162,8 +285,7 @@ impl RaftGrpcMessageFilter for TiFlashGrpcMessageFilter {
             return false;
         }
 
-        let mut usage = 0;
-        memory_usage_reaches_high_water(&mut usage)
+        self.should_reject_by_memory_control_rss()
     }
 }
 
@@ -186,6 +308,11 @@ pub fn run_impl<CER: ConfiguredRaftEngine, F: KvFormat>(
     let memory_limit = tikv.core.config.memory_usage_limit.unwrap().0;
     let high_water = (tikv.core.config.memory_usage_high_water * memory_limit as f64) as u64;
     register_memory_usage_high_water(high_water);
+    tikv.init_memory_control_rss_refresher(
+        tikv.proxy_config
+            .server
+            .exclude_rss_file_from_memory_control,
+    );
 
     tikv.core.check_conflict_addr();
     tikv.core.init_fs();
@@ -620,6 +747,7 @@ impl<CER: ConfiguredRaftEngine, F: KvFormat> TiKvServer<CER, F> {
 
 const DEFAULT_METRICS_FLUSH_INTERVAL: Duration = Duration::from_millis(10_000);
 const DEFAULT_MEMTRACE_FLUSH_INTERVAL: Duration = Duration::from_millis(1_000);
+const MEMORY_CONTROL_RSS_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const DEFAULT_STORAGE_STATS_INTERVAL: Duration = Duration::from_secs(1);
 
 /// A complete TiKV server.
@@ -648,6 +776,7 @@ struct TiKvServer<ER: RaftEngine, F: KvFormat> {
     resource_manager: Option<Arc<ResourceGroupManager>>,
     tablet_registry: Option<TabletRegistry<RocksEngine>>,
     grpc_service_mgr: GrpcServiceManager,
+    memory_control_rss_state: Arc<MemoryControlRssState>,
 }
 
 struct TiKvEngines<EK: KvEngine, ER: RaftEngine> {
@@ -809,6 +938,7 @@ impl<ER: RaftEngine, F: KvFormat> TiKvServer<ER, F> {
             resource_manager,
             tablet_registry: None,
             grpc_service_mgr: GrpcServiceManager::new(tx),
+            memory_control_rss_state: Arc::new(MemoryControlRssState::default()),
         }
     }
 
@@ -1310,6 +1440,9 @@ impl<ER: RaftEngine, F: KvFormat> TiKvServer<ER, F> {
         let copr_config_manager = copr.config_manager();
 
         // Create server
+        let memory_usage_high_water = (self.core.config.memory_usage_high_water
+            * self.core.config.memory_usage_limit.unwrap().0 as f64)
+            as u64;
         let server = Server::new(
             node.id(),
             &server_config,
@@ -1326,8 +1459,10 @@ impl<ER: RaftEngine, F: KvFormat> TiKvServer<ER, F> {
             debug_thread_pool,
             health_controller,
             self.resource_manager.clone(),
-            Arc::new(TiFlashGrpcMessageFilter::new(
+            Arc::new(TiFlashGrpcMessageFilter::new_with_memory_control_rss(
                 server_config.value().reject_messages_on_memory_ratio,
+                memory_usage_high_water,
+                self.memory_control_rss_state.clone(),
             )),
         )
         .unwrap_or_else(|e| fatal!("failed to create server: {}", e));
@@ -1584,6 +1719,17 @@ impl<ER: RaftEngine, F: KvFormat> TiKvServer<ER, F> {
             move || {
                 let now = Instant::now();
                 mem_trace_metrics.flush(now);
+            },
+        );
+    }
+
+    fn init_memory_control_rss_refresher(&self, exclude_rss_file: bool) {
+        let state = self.memory_control_rss_state.clone();
+        state.refresh(exclude_rss_file);
+        self.core.background_worker.spawn_interval_task(
+            MEMORY_CONTROL_RSS_REFRESH_INTERVAL,
+            move || {
+                state.refresh(exclude_rss_file);
             },
         );
     }
