@@ -162,6 +162,15 @@ pub fn overwrite_config_with_cmd_args(
         proxy_config.engine_store.enable_unips = enabled == 1;
     }
 
+    if let Some(s) = matches.value_of("exclude-rss-file-from-memory-control") {
+        let enabled = s == "1" || s.eq_ignore_ascii_case("true");
+        proxy_config.server.exclude_rss_file_from_memory_control = enabled;
+        info!(
+            "set exclude_rss_file_from_memory_control for proxy";
+            "enabled" => enabled
+        );
+    }
+
     let mut memory_limit_set = config.memory_usage_limit.is_some();
     if !memory_limit_set {
         if let Some(s) = matches.value_of("memory-limit-size") {

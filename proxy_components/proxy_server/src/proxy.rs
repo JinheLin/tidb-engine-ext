@@ -282,6 +282,13 @@ pub unsafe fn run_proxy(
                 .takes_value(true),
         )
         .arg(
+            Arg::with_name("exclude-rss-file-from-memory-control")
+                .long("exclude-rss-file-from-memory-control")
+                .help("Use adjusted RSS without RssFile for TiFlash proxy memory control")
+                .hidden(true)
+                .takes_value(true),
+        )
+        .arg(
             Arg::with_name("memory-limit-ratio")
                 .long("memory-limit-ratio")
                 .help("Used as the maximum memory we can consume, in percentage")

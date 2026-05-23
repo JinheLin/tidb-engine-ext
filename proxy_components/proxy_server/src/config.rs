@@ -73,6 +73,9 @@ pub struct ServerConfig {
     pub background_thread_count: usize,
     pub status_thread_pool_size: usize,
     pub reject_messages_on_memory_ratio: f64,
+    #[doc(hidden)]
+    #[online_config(skip)]
+    pub exclude_rss_file_from_memory_control: bool,
 }
 
 impl Default for ServerConfig {
@@ -90,6 +93,7 @@ impl Default for ServerConfig {
             background_thread_count,
             status_thread_pool_size: 2,
             reject_messages_on_memory_ratio: 0.05,
+            exclude_rss_file_from_memory_control: false,
         }
     }
 }
