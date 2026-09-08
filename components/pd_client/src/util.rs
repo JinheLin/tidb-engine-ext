@@ -3,7 +3,10 @@
 use core::panic;
 use std::{
     pin::Pin,
-    sync::{atomic::AtomicU64, Arc, RwLock},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, RwLock,
+    },
     thread,
     time::Duration,
 };
@@ -39,6 +42,7 @@ use tikv_util::{
     box_err, debug, error, info, slow_log, time::Instant, timer::GLOBAL_TIMER_HANDLE, warn, Either,
     HandyRwLock,
 };
+use tokio::sync::broadcast;
 use tokio_timer::timer::Handle;
 
 use super::{
@@ -171,6 +175,8 @@ pub struct Client {
     pub(crate) inner: RwLock<Inner>,
     pub feature_gate: FeatureGate,
     enable_forwarding: bool,
+    connection_version: AtomicU64,
+    should_reconnect_tx: broadcast::Sender<u64>,
 }
 
 impl Client {
@@ -183,6 +189,7 @@ impl Client {
         tso: TimestampOracle,
         enable_forwarding: bool,
         retry_interval: Duration,
+        should_reconnect_tx: broadcast::Sender<u64>,
     ) -> Client {
         if !target.direct_connected() {
             REQUEST_FORWARDED_GAUGE_VEC
@@ -229,6 +236,8 @@ impl Client {
             }),
             feature_gate: FeatureGate::default(),
             enable_forwarding,
+            connection_version: AtomicU64::new(1),
+            should_reconnect_tx,
         }
     }
 
@@ -312,6 +321,15 @@ impl Client {
             start_refresh.saturating_elapsed(),
             "PD client refresh region heartbeat",
         );
+        self.connection_version.fetch_add(1, Ordering::Release);
+    }
+
+    pub(crate) fn connection_version(&self) -> u64 {
+        self.connection_version.load(Ordering::Acquire)
+    }
+
+    fn schedule_reconnect(&self) {
+        let _ = self.should_reconnect_tx.send(self.connection_version());
     }
 
     pub fn handle_region_heartbeat_response<F>(self: &Arc<Self>, f: F) -> PdFuture<()>
@@ -511,6 +529,11 @@ where
                 {
                     let resp = self.send_and_receive().await;
                     if self.should_not_retry(&resp) {
+                        if let Err(err) = &resp {
+                            if err.should_reconnect() {
+                                self.client.schedule_reconnect();
+                            }
+                        }
                         return resp;
                     }
                 }

@@ -34,6 +34,7 @@ use tikv_util::{
     box_err, debug, error, info, thd_name, time::Instant, timer::GLOBAL_TIMER_HANDLE, warn, Either,
     HandyRwLock,
 };
+use tokio::sync::broadcast;
 use txn_types::TimeStamp;
 use yatp::{task::future::TaskCell, ThreadPool};
 
@@ -94,6 +95,7 @@ impl RpcClient {
             match pd_connector.validate_endpoints(cfg, true).await {
                 Ok((client, target, members, tso)) => {
                     let cluster_id = members.get_header().get_cluster_id();
+                    let (should_reconnect_tx, mut should_reconnect_rx) = broadcast::channel(1);
                     let rpc_client = RpcClient {
                         cluster_id,
                         pd_client: Arc::new(Client::new(
@@ -105,6 +107,7 @@ impl RpcClient {
                             tso.unwrap(),
                             cfg.enable_forwarding,
                             cfg.retry_interval.0,
+                            should_reconnect_tx,
                         )),
                         monitor: monitor.clone(),
                     };
@@ -143,6 +146,31 @@ impl RpcClient {
                     // Since the monitor does not have other critical task, it
                     // is not a major issue.
                     rpc_client.monitor.spawn(update_loop);
+
+                    // A request with no retries should still trigger a PD leader refresh
+                    // when it observes a connection error. Carry the connection version
+                    // in the notification so failures from a stale client don't cause
+                    // another reconnect after the client has already been refreshed.
+                    let client = Arc::downgrade(&rpc_client.pd_client);
+                    let reconnect_loop = async move {
+                        loop {
+                            let version = match should_reconnect_rx.recv().await {
+                                Ok(version) => version,
+                                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                                Err(broadcast::error::RecvError::Closed) => break,
+                            };
+                            let Some(cli) = client.upgrade() else {
+                                break;
+                            };
+                            if version < cli.connection_version() {
+                                continue;
+                            }
+                            if let Err(e) = cli.reconnect(true).await {
+                                warn!("failed to update PD client after request failure"; "error" => ?e);
+                            }
+                        }
+                    };
+                    rpc_client.monitor.spawn(reconnect_loop);
 
                     let client = Arc::downgrade(&rpc_client.pd_client);
                     let retry_interval = cfg.retry_interval.0;
